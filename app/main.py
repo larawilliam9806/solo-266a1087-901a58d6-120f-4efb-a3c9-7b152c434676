@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from typing_extensions import Annotated
 
 from . import db
+from .cache import RuleLoadError, get_cache
 from .models import (
     MAX_COORD,
     GradeOut,
@@ -46,11 +47,15 @@ def _to_api(rules: List[Rule]) -> List[dict]:
 
 def create_app(db_path: Optional[str] = None) -> FastAPI:
     path = db_path or os.environ.get("GRADING_DB_PATH", "./grading.db")
+    rule_cache = get_cache(path)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         db.init_db(path)
-        yield
+        try:
+            yield
+        finally:
+            rule_cache.close()
 
     app = FastAPI(
         title="陶瓷样品分级服务",
@@ -190,15 +195,24 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             int, Query(ge=0, le=MAX_COORD, description="抗折强度（千帕，非负整数）")
         ],
     ) -> GradeOut:
-        result = db.grade_reading(path, thickness, strength)
-        if result is None:
+        try:
+            snapshot = rule_cache.get_snapshot()
+        except RuleLoadError:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "rule_load_failed",
+                    "message": "分级规则载入失败，请稍后重试",
+                },
+            )
+        if snapshot is None:
             raise HTTPException(
                 status_code=404,
                 detail={"error": "no_table", "message": "尚未登记分级表"},
             )
-        version, g = result
+        g = snapshot.grade(thickness, strength)
         return GradeOut(
-            version=version,
+            version=snapshot.version,
             thickness=thickness,
             strength=strength,
             grade=g,

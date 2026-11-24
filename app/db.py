@@ -5,6 +5,10 @@
   因此核对期间分级查询读到的仍是已生效（已提交）的表；
 - 所见版号在发布时仍有效才会换表（乐观并发控制）；
 - 核对不通过或任何失败都会回滚，继续沿用已生效的表。
+
+分级查询的读路径不在本模块：``GET /grade`` 走 :mod:`app.cache` 的进程内常驻
+缓存，样品集中入仓时不逐件重开连接、不重读版号和规则；本模块只保留写路径
+（登记/换版）与历史版本查询所需的短连接。
 """
 
 from __future__ import annotations
@@ -203,30 +207,5 @@ def apply_swap(
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
-    finally:
-        conn.close()
-
-
-def grade_reading(
-    db_path: str, thickness: int, strength: int
-) -> Optional[Tuple[int, Optional[str]]]:
-    """分级查询：返回 (所用版号, 等级)；等级为 None 表示未分级。
-
-    未登记任何分级表时返回 None。首条命中规则由 ORDER BY ordinal 保证。
-    """
-    conn = connect(db_path)
-    try:
-        row = conn.execute("SELECT current_version FROM meta WHERE id = 1").fetchone()
-        if row is None:
-            return None
-        version = row["current_version"]
-        hit = conn.execute(
-            "SELECT grade FROM rules"
-            " WHERE version = ? AND t_min <= ? AND t_max >= ?"
-            "   AND s_min <= ? AND s_max >= ?"
-            " ORDER BY ordinal LIMIT 1",
-            (version, thickness, thickness, strength, strength),
-        ).fetchone()
-        return version, (hit["grade"] if hit else None)
     finally:
         conn.close()

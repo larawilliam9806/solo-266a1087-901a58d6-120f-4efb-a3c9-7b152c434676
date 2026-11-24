@@ -1,8 +1,11 @@
 """API 端到端测试。"""
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
+from app import db
 from app.main import create_app
 
 
@@ -227,3 +230,70 @@ def test_current_and_history(client):
 def test_current_table_when_empty(client):
     r = client.get("/tables/current")
     assert r.status_code == 404
+
+
+# ---------- 规则缓存：失败 500 且可重试、集中查询不读库 ----------
+
+def test_grade_rule_load_failure_is_500_and_retriable(tmp_path):
+    db_file = tmp_path / "grading.db"
+    app = create_app(str(db_file))
+    with TestClient(app) as c:
+        assert register(c).status_code == 201
+        assert grade(c, 10, 10).status_code == 200
+
+        # 破坏库文件：已提交的表在内存里仍可用，但一旦需要读库就会 500
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(str(db_file) + suffix)
+            if p.exists():
+                p.write_bytes(b"corrupt")
+        # 先制造一次"库有变化"的探测：直接换底层文件已足够，首次读取即失败
+        r = grade(c, 10, 10)
+        assert r.status_code == 500
+        assert r.json()["detail"]["error"] == "rule_load_failed"
+
+        # 重建库并重新登记，下次查询自动重试成功
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(str(db_file) + suffix)
+            if p.exists():
+                p.unlink()
+        db.init_db(str(db_file))
+        r = grade(c, 10, 10)
+        assert r.status_code == 404  # 空库，尚无表
+        assert register(c, [rule(0, 100, 0, 100, "Z")]).status_code == 201
+        body = grade(c, 10, 10).json()
+        assert body["grade"] == "Z" and body["version"] == 1
+
+
+def test_grade_batch_uses_cached_snapshot(tmp_path, monkeypatch):
+    """集中入仓期间不重开连接、不重读规则：统计缓存层的实际读库次数。"""
+    from app import cache as cache_mod
+
+    db_file = tmp_path / "grading.db"
+    app = create_app(str(db_file))
+    rule_cache = cache_mod.get_cache(str(db_file))
+    opens = {"n": 0}
+    loads = {"n": 0}
+    orig_connect = rule_cache._connect
+    orig_load = rule_cache._load_snapshot
+
+    def counting_connect():
+        opens["n"] += 1
+        return orig_connect()
+
+    def counting_load(conn):
+        loads["n"] += 1
+        return orig_load(conn)
+
+    monkeypatch.setattr(rule_cache, "_connect", counting_connect)
+    monkeypatch.setattr(rule_cache, "_load_snapshot", counting_load)
+
+    with TestClient(app) as c:
+        assert register(c).status_code == 201
+        # 首查触发一次连接 + 一次规则读取
+        assert grade(c, 1, 1).status_code == 200
+        assert opens["n"] == 1 and loads["n"] == 1
+        # 再打 200 件，连接与规则读取次数都不再增长
+        for i in range(200):
+            r = grade(c, i % 150, 0)
+            assert r.status_code == 200
+        assert opens["n"] == 1 and loads["n"] == 1
